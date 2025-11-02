@@ -251,6 +251,9 @@ class TRECFormFiller:
                 
                 # Fill detailed inspection comments on pages 3, 4, 5
                 self._fill_inspection_details(writer, sections, form_fields)
+                
+                # Create proper appearances for text fields to fix font issues
+                self._create_text_field_appearances(writer)
 
             # Set NeedAppearances flag to force appearance generation
             if hasattr(writer, '_root_object') and writer._root_object:
@@ -287,7 +290,7 @@ class TRECFormFiller:
         """Comprehensively flatten all form fields to make content permanently visible and non-clickable."""
         try:
             print("DEBUG: Performing comprehensive field flattening...")
-            from PyPDF2.generic import NameObject
+            from PyPDF2.generic import NameObject, TextStringObject
             
             total_processed = 0
             
@@ -332,9 +335,26 @@ class TRECFormFiller:
                                     annot[NameObject('/Ff')] = 1  # Read-only flag
                                     annot[NameObject('/F')] = 4   # Print flag (makes it visible when printed/flattened)
                                     
-                                    # For text fields: ensure value is visible
+                                    # For text fields: ensure value is visible with proper appearance
                                     if field_type == '/Tx' and field_value:
-                                        # Force the appearance to show the text
+                                        # Be less aggressive with text field flattening to preserve fonts
+                                        # Keep essential properties for text display
+                                        essential_text_properties = ['/DA', '/Q', '/MaxLen']
+                                        properties_to_keep = {}
+                                        
+                                        for prop in essential_text_properties:
+                                            if prop in annot:
+                                                properties_to_keep[prop] = annot[prop]
+                                        
+                                        # Restore essential properties after removal
+                                        for prop, value in properties_to_keep.items():
+                                            annot[NameObject(prop)] = value
+                                        
+                                        # Ensure proper font appearance if missing
+                                        if '/DA' not in annot:
+                                            annot[NameObject('/DA')] = TextStringObject('0 0 0 rg /Helv 10 Tf')
+                                        
+                                        # Force appearance generation
                                         if '/AP' not in annot:
                                             annot[NameObject('/AP')] = {}
                                     
@@ -508,7 +528,9 @@ class TRECFormFiller:
             for i, field in enumerate(checkbox_fields[:10]):
                 print(f"DEBUG: Checkbox field {i}: '{field}'")
             
-            # Determine checkbox values by examining existing field properties
+            # Determine checkbox values - NEW LOGIC: Empty for checked, X for unchecked  
+            # For checked status: use 'Off' (which will show empty)
+            # For unchecked status: use 'Yes' (which will show X mark)
             checkbox_values_to_try = ['Yes', 'On', '1', '/Yes', '/On', '/1', True]
             
             # Fill checkboxes for each section (assuming 4 columns: I, NI, NP, D)
@@ -543,49 +565,36 @@ class TRECFormFiller:
                 # Remove duplicates while preserving order
                 checkbox_patterns = list(dict.fromkeys(checkbox_patterns))
                 
-                # Create checkbox update data for the current page
+                # Create checkbox update data for the current section
                 checkbox_data = {}
                 
-                # Mark the appropriate status checkbox - try multiple field name patterns and values
-                target_checkbox_index = None
-                if status == 'I':
-                    target_checkbox_index = base_index
-                elif status == 'NI':
-                    target_checkbox_index = base_index + 1
-                elif status == 'NP':
-                    target_checkbox_index = base_index + 2
-                elif status == 'D':
-                    target_checkbox_index = base_index + 3
+                # SWAPPED LOGIC: Now checked boxes are empty, unchecked show X marks
+                # - The selected status gets 'Off' (empty appearance)
+                # - The other 3 statuses get 'Yes' (X mark appearance)
                 
-                if target_checkbox_index is not None:
-                    # Try different checkbox field name patterns
-                    checkbox_found = False
-                    target_field_patterns = [
-                        f'CheckBox1[{target_checkbox_index}]'
-                    ]
+                status_indices = {
+                    'I': base_index,      # Inspected
+                    'NI': base_index + 1, # Not Inspected  
+                    'NP': base_index + 2, # Not Present
+                    'D': base_index + 3   # Deficient
+                }
+                
+                # Mark all 4 checkboxes for this section
+                for status_type, checkbox_index in status_indices.items():
+                    checkbox_field = f'CheckBox1[{checkbox_index}]'
                     
-                    # Add BOM-prefixed patterns
-                    for field_name in form_fields.keys():
-                        if f'CheckBox1[{target_checkbox_index}]' in field_name:
-                            target_field_patterns.append(field_name)
-                    
-                    for field_pattern in target_field_patterns:
-                        if field_pattern in form_fields:
-                            # Try different checkbox values
-                            for checkbox_value in checkbox_values_to_try:
-                                try:
-                                    checkbox_data[field_pattern] = checkbox_value
-                                    checkbox_found = True
-                                    print(f"DEBUG: Will check {field_pattern} for section '{section['name'][:20]}' status '{status}' with value '{checkbox_value}'")
-                                    total_checkbox_updates += 1
-                                    break  # Use first working value
-                                except Exception as e:
-                                    continue
-                            if checkbox_found:
-                                break
-                    
-                    if not checkbox_found:
-                        print(f"DEBUG: Could not find checkbox field for index {target_checkbox_index}")
+                    # Check if this checkbox field exists
+                    if checkbox_field in form_fields:
+                        if status_type == status:
+                            # This is the selected status - show empty (checked)
+                            checkbox_data[checkbox_field] = 'Off'
+                            print(f"DEBUG: Will show EMPTY for {checkbox_field} (selected status '{status}')")
+                        else:
+                            # This is not the selected status - show X mark (unchecked)
+                            checkbox_data[checkbox_field] = 'Yes'
+                            print(f"DEBUG: Will show X MARK for {checkbox_field} (unselected status '{status_type}')")
+                        
+                        total_checkbox_updates += 1
                 
                 # Update the page with checkbox data and force appearance generation
                 if checkbox_data:
@@ -719,16 +728,27 @@ class TRECFormFiller:
                             if '/N' not in appearance_dict:
                                 appearance_dict['/N'] = DictionaryObject()
                             
-                            # Create "Yes" appearance state (checked)
+                            # Create "Yes" appearance state (checked) - EMPTY for checked boxes
                             normal_appearance = appearance_dict['/N']
                             if '/Yes' not in normal_appearance:
-                                # Create a simple checked appearance
+                                # Create an EMPTY appearance for checked checkboxes (no visual mark)
                                 normal_appearance['/Yes'] = DictionaryObject({
                                     '/Type': '/XObject',
                                     '/Subtype': '/Form',
                                     '/BBox': ArrayObject([0, 0, 1000, 1000]),
+                                    '/Length': 20,
+                                    '/Stream': TextStringObject('q\n0 0 1000 1000 re\nW\nn\nQ')  # Empty appearance for checked
+                                })
+                            
+                            # Create "Off" appearance state (unchecked) - X MARK for unchecked boxes
+                            if '/Off' not in normal_appearance:
+                                # Create an X mark appearance for unchecked checkboxes
+                                normal_appearance['/Off'] = DictionaryObject({
+                                    '/Type': '/XObject',
+                                    '/Subtype': '/Form',
+                                    '/BBox': ArrayObject([0, 0, 1000, 1000]),
                                     '/Length': 44,
-                                    '/Stream': TextStringObject('q\n0 0 1000 1000 re\nW\nn\nBT\n/F1 800 Tf\n100 100 Td\n(X) Tj\nET\nQ')
+                                    '/Stream': TextStringObject('q\n0 0 1000 1000 re\nW\nn\nBT\n/F1 800 Tf\n100 100 Td\n(X) Tj\nET\nQ')  # X mark for unchecked
                                 })
                             
                             # Set the appearance state
@@ -777,21 +797,22 @@ class TRECFormFiller:
                             print(f"DEBUG: MATCH! Setting {field_name} to {field_value}")
                             
                             # Set the value using proper PyPDF2 objects
-                            annot[NameObject('/V')] = NameObject('/' + field_value)
-                            
-                            # Set the appearance state to match the value
-                            if field_value in ['Yes', '/Yes']:
+                            from PyPDF2.generic import NameObject
+                            if field_value == 'Off':
+                                # Checked state - show empty
+                                annot[NameObject('/V')] = NameObject('/Off')
+                                annot[NameObject('/AS')] = NameObject('/Off')
+                                print(f"DEBUG: Set {field_name} to CHECKED (empty appearance)")
+                            elif field_value == 'Yes':
+                                # Unchecked state - show X mark
+                                annot[NameObject('/V')] = NameObject('/Yes')
                                 annot[NameObject('/AS')] = NameObject('/Yes')
-                                print(f"DEBUG: Set appearance state to /Yes")
-                            elif field_value in ['On', '/On']:
-                                annot[NameObject('/AS')] = NameObject('/On')
-                                print(f"DEBUG: Set appearance state to /On")
-                            elif field_value in ['1', '/1']:
-                                annot[NameObject('/AS')] = NameObject('/1')
-                                print(f"DEBUG: Set appearance state to /1")
+                                print(f"DEBUG: Set {field_name} to UNCHECKED (X mark appearance)")
                             else:
+                                # Fallback for other values
+                                annot[NameObject('/V')] = NameObject('/' + str(field_value))
                                 annot[NameObject('/AS')] = NameObject('/' + str(field_value))
-                                print(f"DEBUG: Set appearance state to /{field_value}")
+                                print(f"DEBUG: Set {field_name} to fallback value: {field_value}")
                             
                             states_set += 1
                         elif field_type == '/Btn':
@@ -805,6 +826,77 @@ class TRECFormFiller:
             
         except Exception as e:
             print(f"DEBUG: Error in _set_checkbox_appearance_state: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _create_text_field_appearances(self, writer: PdfWriter) -> None:
+        """Create proper appearances for text fields to fix font display issues."""
+        try:
+            print("DEBUG: Creating text field appearances to fix font issues...")
+            from PyPDF2.generic import NameObject, TextStringObject
+            
+            text_fields_fixed = 0
+            
+            for page_num, page in enumerate(writer.pages):
+                if '/Annots' in page:
+                    annotations = page['/Annots']
+                    page_text_fields = 0
+                    
+                    for annot_ref in annotations:
+                        try:
+                            annot = annot_ref.get_object()
+                            
+                            # Check if this is a text field widget with a value
+                            if ('/Subtype' in annot and annot['/Subtype'] == '/Widget' and
+                                '/FT' in annot and annot['/FT'] == '/Tx' and
+                                '/V' in annot and annot['/V']):
+                                
+                                field_name = str(annot.get('/T', ''))
+                                field_value = str(annot.get('/V', ''))
+                                
+                                if field_value and field_value.strip():  # Only process non-empty values
+                                    print(f"DEBUG: Fixing text field appearance for '{field_name}' with value: {field_value[:30]}...")
+                                    
+                                    # Ensure proper text encoding for the field value
+                                    try:
+                                        # Convert to proper PDF string format
+                                        if isinstance(field_value, str):
+                                            # Encode as PDF string to handle special characters
+                                            encoded_value = field_value.encode('latin-1', errors='replace').decode('latin-1')
+                                            annot[NameObject('/V')] = TextStringObject(encoded_value)
+                                    except Exception as encoding_error:
+                                        print(f"DEBUG: Text encoding error for {field_name}: {encoding_error}")
+                                        # Fallback to simple string
+                                        annot[NameObject('/V')] = TextStringObject(field_value)
+                                    
+                                    # Set proper font and appearance properties
+                                    annot[NameObject('/F')] = 4  # Print flag
+                                    
+                                    # Remove properties that might cause font issues
+                                    problematic_properties = ['/TM', '/DA']
+                                    for prop in problematic_properties:
+                                        if prop in annot:
+                                            del annot[prop]
+                                    
+                                    # Set default appearance if not present
+                                    if '/DA' not in annot:
+                                        # Use a safe default font appearance
+                                        annot[NameObject('/DA')] = TextStringObject('0 0 0 rg /Helv 12 Tf')
+                                    
+                                    page_text_fields += 1
+                                    text_fields_fixed += 1
+                                    
+                        except Exception as e:
+                            print(f"DEBUG: Error fixing text field appearance: {e}")
+                            continue
+                    
+                    if page_text_fields > 0:
+                        print(f"DEBUG: Fixed {page_text_fields} text fields on page {page_num + 1}")
+            
+            print(f"DEBUG: Total text fields fixed: {text_fields_fixed}")
+            
+        except Exception as e:
+            print(f"DEBUG: Text field appearance fixing failed: {e}")
             import traceback
             traceback.print_exc()
 
